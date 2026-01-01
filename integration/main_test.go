@@ -53,7 +53,8 @@ func runWithVM(t *testing.T, runTest func(*testing.T, vm.Instance)) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			vm, err := tc.vmm.NewInstance(t.Context(), t.TempDir())
+			// Use short temp dir to avoid Unix socket path length limits on macOS
+			vm, err := tc.vmm.NewInstance(t.Context(), shortTempDir(t))
 			if err != nil {
 				t.Fatal("Failed to create VM instance:", err)
 			}

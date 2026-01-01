@@ -44,6 +44,7 @@ import (
 	"github.com/containerd/nerdbox/api/services/vmevents/v1"
 	"github.com/containerd/nerdbox/internal/kvm"
 	"github.com/containerd/nerdbox/internal/nwcfg"
+	"github.com/containerd/nerdbox/internal/shim/sandbox"
 	"github.com/containerd/nerdbox/internal/shim/task/bundle"
 	"github.com/containerd/nerdbox/internal/vm"
 )
@@ -54,10 +55,10 @@ var (
 )
 
 // NewTaskService creates a new instance of a task service
-func NewTaskService(ctx context.Context, vmm vm.Manager, publisher shim.Publisher, sd shutdown.Service) (taskAPI.TTRPCTaskService, error) {
+func NewTaskService(ctx context.Context, sb *sandbox.Service, publisher shim.Publisher, sd shutdown.Service) (taskAPI.TTRPCTaskService, error) {
 	s := &service{
 		context:          ctx,
-		vmm:              vmm,
+		sandbox:          sb,
 		events:           make(chan any, 128),
 		containers:       make(map[string]*container),
 		initiateShutdown: sd.Shutdown,
@@ -85,13 +86,8 @@ type container struct {
 type service struct {
 	mu sync.Mutex
 
-	// vmm is the VM manager used to create the VM instance
-	// TODO: Move this and instance to separate service so
-	// that the managemnt can be shared with sandbox service
-	vmm vm.Manager
-
-	// vm is the VM instance used to run the container
-	vm vm.Instance
+	// sandbox is the sandbox service that manages the VM
+	sandbox *sandbox.Service
 
 	context context.Context
 	events  chan any
@@ -124,11 +120,7 @@ func (s *service) shutdown(ctx context.Context) error {
 		}
 	}
 
-	if s.vm != nil {
-		if err := s.vm.Shutdown(ctx); err != nil {
-			errs = append(errs, fmt.Errorf("vm shutdown: %w", err))
-		}
-	}
+	// VM shutdown is handled by sandbox service
 
 	// Signal last event and stop forwarding
 	s.events <- nil
@@ -207,16 +199,32 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
 	}
 	b.AddExtraFile(nwcfg.Filename, nwJSON)
 
-	vmState := filepath.Join(r.Bundle, "vm")
-	if err := os.Mkdir(vmState, 0700); err != nil {
-		return nil, errgrpc.ToGRPCf(err, "failed to create vm state directory %q", vmState)
-	}
-	vmi, err := s.vmInstance(ctx, vmState)
-	if err != nil {
-		return nil, errgrpc.ToGRPC(err)
+	// Check sandbox is in running state (StartSandbox was called)
+	if !s.sandbox.IsSandboxRunning() {
+		return nil, errgrpc.ToGRPCf(errdefs.ErrFailedPrecondition,
+			"sandbox not running; call StartSandbox before CreateTask")
 	}
 
-	m, err := setupMounts(ctx, vmi, r.ID, r.Rootfs, b.Rootfs, filepath.Join(r.Bundle, "mounts"))
+	// Get VM from sandbox service (sandbox must be created before task creation)
+	vmi := s.sandbox.VM()
+	if vmi == nil {
+		return nil, errgrpc.ToGRPCf(errdefs.ErrFailedPrecondition, "sandbox VM not available")
+	}
+
+	// Check if VM is already running
+	// Mounts and networking must be configured before VM starts, so if VM is
+	// already running, we cannot add new mounts. This means only one container
+	// per sandbox is currently supported.
+	var m []*types.Mount
+	if s.sandbox.IsRunning() {
+		// VM already running - this would be the second container
+		// For now, return error as multi-container per sandbox is not yet supported
+		return nil, errgrpc.ToGRPCf(errdefs.ErrFailedPrecondition,
+			"sandbox VM already running; only one container per sandbox is currently supported")
+	}
+
+	// First container - set up mounts and networking on VM before starting
+	m, err = setupMounts(ctx, vmi, r.ID, r.Rootfs, b.Rootfs, filepath.Join(r.Bundle, "mounts"))
 	if err != nil {
 		return nil, errgrpc.ToGRPC(err)
 	}
@@ -225,14 +233,12 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
 		return nil, errgrpc.ToGRPC(err)
 	}
 
+	// Start VM with init args
 	prestart := time.Now()
-	if err := vmi.Start(ctx,
-		vm.WithInitArgs(nwpr.InitArgs()...),
-	); err != nil {
+	if err := s.sandbox.StartVM(ctx, vm.WithInitArgs(nwpr.InitArgs()...)); err != nil {
 		return nil, errgrpc.ToGRPC(err)
 	}
-	bootTime := time.Since(prestart)
-	log.G(ctx).WithField("bootTime", bootTime).Debug("VM started")
+	log.G(ctx).WithField("bootTime", time.Since(prestart)).Debug("VM started by task")
 
 	vmc, err := s.client()
 	if err != nil {
@@ -320,8 +326,7 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
 	}
 
 	log.G(ctx).WithFields(log.Fields{
-		"t_boot":   bootTime,
-		"t_setup":  setupTime - bootTime,
+		"t_setup":  setupTime,
 		"t_create": time.Since(preCreate),
 	}).Info("task successfully created")
 
@@ -419,7 +424,7 @@ func (s *service) Exec(ctx context.Context, r *taskAPI.ExecProcessRequest) (*pty
 		Terminal: r.Terminal,
 	}
 
-	cio, ioShutdown, err := s.forwardIO(ctx, s.vm, rio)
+	cio, ioShutdown, err := s.forwardIO(ctx, s.sandbox.VM(), rio)
 	if err != nil {
 		return nil, errgrpc.ToGRPC(err)
 	}
